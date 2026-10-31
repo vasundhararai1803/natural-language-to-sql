@@ -14,6 +14,7 @@ from backend.services.sql_validation_service import SQLValidationService
 from backend.services.query_execution_service import QueryExecutionService
 from backend.services.analysis_service import DiagnosticAnalysisService
 from backend.services.schema_service import SchemaService
+from backend.services.chart_service import ChartService
 
 client = TestClient(app)
 
@@ -133,3 +134,59 @@ def test_evaluation_run():
     assert summary["total_tests"] >= 30
     assert summary["sql_safety_rate_pct"] == 100.0
     assert summary["overall_accuracy_pct"] >= 90.0
+
+
+def test_chart_generation_resilience():
+    # Test 1: 1-4 categorical rows with proportional column
+    rows = [
+        {"region_name": "North America - West", "cancellation_rate_pct": 18.5},
+        {"region_name": "North America - East", "cancellation_rate_pct": 9.2},
+        {"region_name": "Europe - Central", "cancellation_rate_pct": 7.1}
+    ]
+    spec = ChartService.generate_chart_spec(
+        intent_type="ratio_analysis",
+        columns=["region_name", "cancellation_rate_pct"],
+        rows=rows
+    )
+    assert spec is not None
+    assert spec.chart_type in ["pie", "bar"]
+
+    # Test 2: Fallback to table if empty or malformed
+    spec_table = ChartService.generate_chart_spec(
+        intent_type="custom",
+        columns=["note"],
+        rows=[{"note": "text only"}]
+    )
+    assert spec_table is not None
+    assert spec_table.chart_type == "table"
+
+
+def test_sql_security_and_preservation():
+    # Preserve legitimate REPLACE and CHAR
+    sql = "SELECT REPLACE(product_name, 'Pro', 'Plus'), CHAR(65) FROM products LIMIT 5"
+    is_valid, err, tables = SQLValidationService.validate_sql(sql)
+    assert is_valid is True
+    assert "products" in tables
+
+    # Reject forbidden catalog
+    is_valid, err, _ = SQLValidationService.validate_sql("SELECT * FROM sqlite_master")
+    assert is_valid is False
+    assert "Direct access to internal database catalogs" in err
+
+    # Reject mutating operation
+    is_valid, err, _ = SQLValidationService.validate_sql("PRAGMA table_info(transactions)")
+    assert is_valid is False
+
+
+def test_persistent_storage():
+    from backend.repositories.storage import save_history_entry, get_history_entries
+    save_history_entry({
+        "request_id": "test-uuid-99",
+        "question": "Diagnostic test?",
+        "query_status": "success",
+        "execution_mode": "fallback",
+        "summary": "Tested successfully"
+    })
+    entries = get_history_entries(limit=5)
+    assert len(entries) > 0
+    assert any(e.get("request_id") == "test-uuid-99" for e in entries)

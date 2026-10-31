@@ -7,6 +7,23 @@ from backend.models.api_schemas import SchemaTable, SchemaColumn, MetricDefiniti
 
 ALLOWED_TABLES = {"transactions", "products", "customers", "regions"}
 
+SCHEMA_COLUMNS_BY_TABLE: Dict[str, set] = {
+    "transactions": {
+        "transaction_id", "transaction_timestamp", "customer_id", "product_id",
+        "region_id", "quantity", "unit_price", "discount_amount",
+        "transaction_status", "payment_method", "channel"
+    },
+    "products": {
+        "product_id", "product_name", "category", "subcategory"
+    },
+    "customers": {
+        "customer_id", "customer_segment", "signup_date"
+    },
+    "regions": {
+        "region_id", "region_name", "country"
+    }
+}
+
 METRIC_DEFINITIONS: List[MetricDefinition] = [
     MetricDefinition(
         metric_id="completed_transactions",

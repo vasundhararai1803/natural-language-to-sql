@@ -7,12 +7,15 @@ import {
   ShieldAlert,
   Activity,
   CheckCircle2,
-  RotateCw
+  RotateCw,
+  AlertCircle,
+  X
 } from 'lucide-react';
 import type { QueryResponse, SchemaTable, MetricDefinition, BenchmarkSummary } from './types';
 import { AnalysisResult } from './components/AnalysisResult';
 import { SchemaExplorer } from './components/SchemaExplorer';
 import { EvaluationDashboard } from './components/EvaluationDashboard';
+import { API_BASE_URL } from './config';
 
 const SAMPLE_QUESTIONS = [
   "Why did transactions drop last week?",
@@ -25,9 +28,10 @@ const SAMPLE_QUESTIONS = [
 ];
 
 export function App() {
-  const [activeView, setActiveView] = useState<'analytics' | 'schema' | 'evaluation' | 'settings'>('analytics');
+  const [activeView, setActiveView] = useState<'analytics' | 'schema' | 'evaluation'>('analytics');
   const [question, setQuestion] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [currentResponse, setCurrentResponse] = useState<QueryResponse | null>(null);
   const [history, setHistory] = useState<QueryResponse[]>([]);
   const [tables, setTables] = useState<SchemaTable[]>([]);
@@ -41,11 +45,12 @@ export function App() {
     fetchSchema();
     fetchMetrics();
     fetchBenchmark();
+    fetchHistory();
   }, []);
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(`${API_BASE_URL}/api/health`);
       if (res.ok) {
         const data = await res.json();
         setApiHealth(data);
@@ -57,7 +62,7 @@ export function App() {
 
   const fetchSchema = async () => {
     try {
-      const res = await fetch('/api/schema');
+      const res = await fetch(`${API_BASE_URL}/api/schema`);
       if (res.ok) setTables(await res.json());
     } catch (e) {
       console.error("Schema fetch error", e);
@@ -66,7 +71,7 @@ export function App() {
 
   const fetchMetrics = async () => {
     try {
-      const res = await fetch('/api/metrics/definitions');
+      const res = await fetch(`${API_BASE_URL}/api/metrics/definitions`);
       if (res.ok) setMetrics(await res.json());
     } catch (e) {
       console.error("Metrics fetch error", e);
@@ -75,10 +80,27 @@ export function App() {
 
   const fetchBenchmark = async () => {
     try {
-      const res = await fetch('/api/evaluation/results');
+      const res = await fetch(`${API_BASE_URL}/api/evaluation/results`);
       if (res.ok) setBenchmark(await res.json());
     } catch (e) {
       console.error("Benchmark fetch error", e);
+    }
+  };
+
+  const fetchHistory = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/history`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          setHistory(data);
+          if (!currentResponse) {
+            setCurrentResponse(data[0]);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("History fetch error", e);
     }
   };
 
@@ -87,9 +109,10 @@ export function App() {
     if (!q.trim()) return;
 
     setIsLoading(true);
+    setErrorMessage(null);
     setActiveView('analytics');
     try {
-      const res = await fetch('/api/ask', {
+      const res = await fetch(`${API_BASE_URL}/api/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q })
@@ -100,10 +123,12 @@ export function App() {
         setCurrentResponse(data);
         setHistory((prev) => [data, ...prev.filter((h) => h.request_id !== data.request_id)]);
       } else {
-        alert("Failed to analyze question. Please verify backend service is running.");
+        const errJson = await res.json().catch(() => ({ detail: 'Failed to analyze question.' }));
+        setErrorMessage(errJson.detail || "Unable to reach backend analytics engine. Please ensure server is running.");
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error("Error asking question", e);
+      setErrorMessage("Network error: Failed to connect to QueryLens AI backend.");
     } finally {
       setIsLoading(false);
     }
@@ -111,14 +136,18 @@ export function App() {
 
   const handleRunBenchmark = async () => {
     setIsBenchmarking(true);
+    setErrorMessage(null);
     try {
-      const res = await fetch('/api/evaluation/run', { method: 'POST' });
+      const res = await fetch(`${API_BASE_URL}/api/evaluation/run`, { method: 'POST' });
       if (res.ok) {
         const data: BenchmarkSummary = await res.json();
         setBenchmark(data);
+      } else {
+        setErrorMessage("Benchmark execution failed. Check server logs.");
       }
     } catch (e) {
       console.error("Benchmark run error", e);
+      setErrorMessage("Network error: Could not complete benchmark suite run.");
     } finally {
       setIsBenchmarking(false);
     }
@@ -219,8 +248,8 @@ export function App() {
               Active
             </span>
           </div>
-          <div className="text-xs font-mono text-slate-200">
-            {apiHealth?.llm_configured ? "OpenAI LLM + Guardrails" : "Deterministic Fallback Engine"}
+          <div className="text-xs font-mono text-slate-200 truncate">
+            {apiHealth?.llm_configured ? "OpenAI / Groq LLM + AST Guard" : "Deterministic Fallback Engine"}
           </div>
         </div>
       </aside>
@@ -239,18 +268,36 @@ export function App() {
           <div className="flex items-center gap-4 text-xs text-slate-400">
             <div className="flex items-center gap-1.5">
               <ShieldAlert className="w-3.5 h-3.5 text-sky-400" />
-              <span>AST SQL Guard: Enforced</span>
+              <span>AST & PRAGMA Guard: Enforced</span>
             </div>
             <span>•</span>
             <div className="flex items-center gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              <span>32/32 Benchmarks Validated</span>
+              <span>
+                {benchmark ? `${benchmark.passed_tests}/${benchmark.total_tests} Benchmarks Verified` : "Automated Benchmarks"}
+              </span>
             </div>
           </div>
         </header>
 
         {/* Dynamic Workspace Views */}
         <div className="p-8 max-w-6xl w-full mx-auto space-y-8 flex-1">
+          {/* Inline Error Notice */}
+          {errorMessage && (
+            <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                <span>{errorMessage}</span>
+              </div>
+              <button
+                onClick={() => setErrorMessage(null)}
+                className="text-slate-400 hover:text-slate-200"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {activeView === 'analytics' && (
             <>
               {/* Natural Language Prompt Search Bar */}
@@ -260,7 +307,7 @@ export function App() {
                     Your data, explained.
                   </h2>
                   <p className="text-sm text-slate-400 mt-2">
-                    Ask business questions in plain English. Get SQL, interactive charts, and evidence-backed root-cause insights.
+                    Ask business questions in plain English. Get validated SQL, interactive charts, and evidence-backed root-cause insights.
                   </p>
                 </div>
 

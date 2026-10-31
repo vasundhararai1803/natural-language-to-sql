@@ -64,7 +64,7 @@ export const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({
             <div className="flex items-center gap-2">
               <h2 className="text-lg font-bold text-slate-100">Benchmark Evaluation Report</h2>
               <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                100% Pass Rate Target
+                {summary.passed_tests}/{summary.total_tests} Verified
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1">
@@ -104,7 +104,7 @@ export const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({
             <div className="text-2xl font-bold font-mono text-sky-400">
               {summary.sql_safety_rate_pct}%
             </div>
-            <p className="text-[11px] text-slate-500 mt-1">100% harmful DDL/DML rejected</p>
+            <p className="text-[11px] text-slate-500 mt-1">Harmful DDL/DML rejected</p>
           </div>
 
           <div className="p-4 rounded-xl bg-slate-950/40 border border-slate-800/80">
@@ -126,7 +126,7 @@ export const EvaluationDashboard: React.FC<EvaluationDashboardProps> = ({
             <div className="text-2xl font-bold font-mono text-slate-200">
               {summary.average_latency_ms} <span className="text-xs font-normal">ms</span>
             </div>
-            <p className="text-[11px] text-slate-500 mt-1">Fast deterministic execution</p>
+            <p className="text-[11px] text-slate-500 mt-1">Empirical execution latency</p>
           </div>
         </div>
       </div>

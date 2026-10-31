@@ -3,8 +3,8 @@ FastAPI Router and Endpoints for QueryLens AI.
 """
 import uuid
 import time
-from typing import List, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, HTTPException, Request
 from backend.models.api_schemas import (
     QueryRequest, QueryResponse, SQLValidateRequest,
     SchemaTable, MetricDefinition, BenchmarkSummary, ChartSpec
@@ -17,12 +17,12 @@ from backend.services.analysis_service import DiagnosticAnalysisService
 from backend.services.insight_service import InsightService
 from backend.services.chart_service import ChartService
 from backend.evaluation.benchmark_runner import BenchmarkRunner
+from backend.repositories.storage import (
+    save_history_entry, get_history_entries,
+    save_cached_benchmark, get_cached_benchmark
+)
 
 router = APIRouter(prefix="/api")
-
-# In-memory query history for current session
-QUERY_HISTORY: List[Dict[str, Any]] = []
-CACHED_BENCHMARK: BenchmarkSummary = None
 
 
 @router.get("/health")
@@ -31,7 +31,12 @@ def health_check():
         "status": "healthy",
         "service": "QueryLens AI API",
         "llm_configured": LLMService.is_llm_configured(),
-        "database": "sqlite:///data/querylens.db"
+        "database": "sqlite:///data/querylens.db",
+        "security": {
+            "ast_validation": "enforced",
+            "read_only_connection": "enforced",
+            "query_only_pragma": "enforced"
+        }
     }
 
 
@@ -56,8 +61,8 @@ def validate_sql(req: SQLValidateRequest):
 
 
 @router.post("/ask", response_model=QueryResponse)
-async def ask_question(req: QueryRequest):
-    req_id = str(uuid.uuid4())[:8]
+async def ask_question(req: QueryRequest, request: Request):
+    req_id = getattr(request.state, "request_id", str(uuid.uuid4())[:8])
     start_time = time.perf_counter()
 
     # 1. Process question through LLM or Fallback Engine
@@ -68,7 +73,7 @@ async def ask_question(req: QueryRequest):
     unsupp = processed["unsupported"]
     exec_mode = processed["execution_mode"]
 
-    # 2. Case: Ambiguous Question
+    # 2. Case: Ambiguous Question or Unrecognized Intent (requesting clarification)
     if clarif:
         resp = QueryResponse(
             request_id=req_id,
@@ -76,22 +81,23 @@ async def ask_question(req: QueryRequest):
             interpreted_intent=intent or {"type": "ambiguous"},
             clarification_required=True,
             clarification_message=clarif,
-            assumptions=["Request requires disambiguation between revenue, volume, and order value."],
+            assumptions=["Inquiry requires disambiguation between volume, revenue, or specific product dimensions."],
             sql="",
             query_status="clarification",
             execution_time_ms=round((time.perf_counter() - start_time) * 1000, 2),
-            summary="Clarification requested to disambiguate performance metrics.",
-            key_findings=["Multiple plausible metric definitions exist for this question."],
+            summary="Clarification requested to disambiguate the metric or dimension.",
+            key_findings=["Multiple interpretations exist or inquiry lacks specific metric constraints."],
             execution_mode=exec_mode,
             follow_up_questions=[
                 "Completed transactions last week",
                 "Total net revenue last week",
-                "Average order value last week"
+                "Average order value last week",
+                "Which region has the highest cancellation rate?"
             ],
-            confidence_score=0.5,
-            confidence_reasoning="High semantic ambiguity in user phrasing."
+            confidence_score=intent.get("confidence", 0.40) if isinstance(intent, dict) else 0.40,
+            confidence_reasoning="Confidence lowered due to semantic ambiguity or unmapped entities."
         )
-        QUERY_HISTORY.insert(0, resp.model_dump())
+        save_history_entry(resp.model_dump())
         return resp
 
     # 3. Case: Unsupported Metric
@@ -101,12 +107,12 @@ async def ask_question(req: QueryRequest):
             question=req.question,
             interpreted_intent=intent or {"type": "unsupported"},
             clarification_required=False,
-            assumptions=["Metric cannot be computed with available schema."],
+            assumptions=["Requested metric is not modeled within the transactions schema catalog."],
             sql="",
             query_status="rejected",
             execution_time_ms=round((time.perf_counter() - start_time) * 1000, 2),
             summary=unsupp,
-            key_findings=["Metric absent from data catalog."],
+            key_findings=["Metric is not modeled in the available retail orders database."],
             limitations=[unsupp],
             execution_mode=exec_mode,
             follow_up_questions=[
@@ -115,23 +121,23 @@ async def ask_question(req: QueryRequest):
                 "Which region has the highest cancellation rate?"
             ],
             confidence_score=1.0,
-            confidence_reasoning="Confirmed metric absence."
+            confidence_reasoning="Metric absence confirmed against relational schema catalog."
         )
-        QUERY_HISTORY.insert(0, resp.model_dump())
+        save_history_entry(resp.model_dump())
         return resp
 
     # 4. Check for 'Why Did This Change?' Diagnostic Intent
     if intent and intent.get("type") == "diagnostic_why":
-        diag_data = DiagnosticAnalysisService.analyze_drop()
+        diag_data = DiagnosticAnalysisService.analyze_drop(question=req.question)
         insights = InsightService.generate_diagnostic_insight(diag_data, req.question)
         
         # Execute query for table visualization
-        ok, cols, rows, exec_ms, err = QueryExecutionService.execute_query(raw_sql)
+        ok, cols, rows, exec_ms, err = QueryExecutionService.execute_query(raw_sql) if raw_sql else (False, [], [], 0.0, "No SQL")
         chart_spec = ChartService.generate_chart_spec(
             intent_type="diagnostic_why",
             columns=cols,
             rows=rows,
-            title="Completed Transactions: Baseline vs Current Week by Region"
+            title="Completed Transactions: Baseline vs Current Period by Region"
         )
 
         resp = QueryResponse(
@@ -139,13 +145,12 @@ async def ask_question(req: QueryRequest):
             question=req.question,
             interpreted_intent=intent,
             assumptions=[
-                "Calendar week defined as Monday 00:00:00 to Sunday 23:59:59.",
-                "Current drop week: Oct 12 - Oct 18, 2026. Baseline week: Oct 05 - Oct 11, 2026.",
-                "Completed transactions filtered where transaction_status = 'completed'."
+                f"Comparison baseline: {diag_data.get('baseline_period')}; current period: {diag_data.get('current_period')}.",
+                "Completed transactions strictly filtered where transaction_status = 'completed'."
             ],
-            sql=raw_sql,
+            sql=raw_sql or "",
             query_status="success" if ok else "error",
-            execution_time_ms=exec_ms,
+            execution_time_ms=round((time.perf_counter() - start_time) * 1000, 2),
             columns=cols,
             rows=rows,
             row_count=len(rows),
@@ -154,14 +159,14 @@ async def ask_question(req: QueryRequest):
             summary=insights["summary"],
             key_findings=insights["key_findings"],
             contributing_factors=diag_data["contributing_factors"],
-            data_quality_warnings=["Cancellations spiked in West region during the drop week."],
+            data_quality_warnings=insights.get("data_quality_warnings", []),
             limitations=insights["limitations"],
             execution_mode=exec_mode,
             follow_up_questions=insights["follow_up_questions"],
-            confidence_score=0.98,
-            confidence_reasoning="High confidence based on comparative period SQL aggregation."
+            confidence_score=insights.get("confidence_score", 0.96),
+            confidence_reasoning=insights.get("confidence_reasoning", "Empirically calculated segment contribution shares.")
         )
-        QUERY_HISTORY.insert(0, resp.model_dump())
+        save_history_entry(resp.model_dump())
         return resp
 
     # 5. General Query Execution
@@ -173,17 +178,18 @@ async def ask_question(req: QueryRequest):
         resp = QueryResponse(
             request_id=req_id,
             question=req.question,
-            interpreted_intent=intent,
+            interpreted_intent=intent or {},
             sql=raw_sql,
             query_status="error",
-            execution_time_ms=exec_ms,
+            execution_time_ms=round((time.perf_counter() - start_time) * 1000, 2),
             summary=f"Query Execution Blocked or Failed: {err}",
             key_findings=[err],
-            limitations=["Execution was rejected by safety policy or database engine."],
+            limitations=["Execution was rejected by safety policy, AST validation, or database engine."],
             execution_mode=exec_mode,
-            confidence_score=0.0
+            confidence_score=0.0,
+            confidence_reasoning="Query execution failed."
         )
-        QUERY_HISTORY.insert(0, resp.model_dump())
+        save_history_entry(resp.model_dump())
         return resp
 
     insights = InsightService.generate_general_insight(req.question, cols, rows, raw_sql)
@@ -198,10 +204,10 @@ async def ask_question(req: QueryRequest):
         request_id=req_id,
         question=req.question,
         interpreted_intent=intent,
-        assumptions=["Data filtered according to active business metric specifications."],
+        assumptions=["Data filtered according to active business metric definitions and read-only AST safety rules."],
         sql=raw_sql,
         query_status="success",
-        execution_time_ms=exec_ms,
+        execution_time_ms=round((time.perf_counter() - start_time) * 1000, 2),
         columns=cols,
         rows=rows,
         row_count=len(rows),
@@ -209,31 +215,35 @@ async def ask_question(req: QueryRequest):
         chart_spec=chart_spec,
         summary=insights["summary"],
         key_findings=insights["key_findings"],
+        data_quality_warnings=insights.get("data_quality_warnings", []),
         limitations=insights["limitations"],
         execution_mode=exec_mode,
         follow_up_questions=insights["follow_up_questions"],
-        confidence_score=0.95,
-        confidence_reasoning="Verified SQL execution against relational schema."
+        confidence_score=insights.get("confidence_score", 0.95),
+        confidence_reasoning=insights.get("confidence_reasoning", "Verified AST-parsed SQL execution against relational schema.")
     )
-    QUERY_HISTORY.insert(0, resp.model_dump())
+    save_history_entry(resp.model_dump())
     return resp
 
 
 @router.get("/history")
 def get_history():
-    return QUERY_HISTORY[:20]
+    return get_history_entries(limit=25)
 
 
 @router.post("/evaluation/run", response_model=BenchmarkSummary)
-def run_evaluation():
-    global CACHED_BENCHMARK
-    CACHED_BENCHMARK = BenchmarkRunner.run_benchmark()
-    return CACHED_BENCHMARK
+def run_evaluation(mode: Optional[str] = "fallback"):
+    summary = BenchmarkRunner.run_benchmark(mode=mode or "fallback")
+    save_cached_benchmark(summary.model_dump())
+    return summary
 
 
 @router.get("/evaluation/results", response_model=BenchmarkSummary)
 def get_evaluation_results():
-    global CACHED_BENCHMARK
-    if CACHED_BENCHMARK is None:
-        CACHED_BENCHMARK = BenchmarkRunner.run_benchmark()
-    return CACHED_BENCHMARK
+    cached = get_cached_benchmark()
+    if cached:
+        return BenchmarkSummary(**cached)
+    # If no cached run exists yet, execute benchmark and cache
+    summary = BenchmarkRunner.run_benchmark(mode="fallback")
+    save_cached_benchmark(summary.model_dump())
+    return summary
